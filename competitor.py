@@ -36,7 +36,7 @@ class CompetitorResponse(BaseModel):
 openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
 scrapfly_api_key = os.getenv("SCRAPFLY_API_KEY")
 openai_model_name = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo") # Provide a default model
-openai_base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1") # Provide a default base URL if needed
+openai_base_url = os.getenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1") # Provide a default base URL if needed
 
 if not openrouter_api_key:
     # Assuming OPENROUTER_API_KEY might be intended for OpenAI key via OpenRouter
