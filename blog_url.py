@@ -1,205 +1,179 @@
 import logging
 import os
+import sys
 import asyncio
+import json
 from typing import List
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote
+
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError
-from scrapfly import ScrapflyClient, ScrapeConfig, ScrapflyError
-from bs4 import BeautifulSoup
-import json # Import the json module for JSON output
+import httpx
 
-# Logging setup
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler()]
+    handlers=[logging.StreamHandler(sys.stderr)]
 )
 logger = logging.getLogger(__name__)
 
-# Load environment variables
 load_dotenv()
-scrapfly_api_key = os.getenv("SCRAPFLY_API_KEY")
-if not scrapfly_api_key:
-    raise ValueError("SCRAPFLY_API_KEY environment variable is required")
 
-# Pydantic model for web results
 class WebResult(BaseModel):
     title: str
     url: str
 
-# Updated Scrapfly search function (with minor robustness improvements)
-def search_web_with_scrapfly(keyword: str, scrapfly_api_key: str, search_engine: str = "google") -> List[WebResult]:
-    logger.info(f"Searching {search_engine} for keyword: {keyword}")
-    client = ScrapflyClient(key=scrapfly_api_key)
+async def search_web_with_scraperapi(
+    keyword: str,
+    scraperapi_key: str,
+    search_engine: str = "google",
+    http_client: httpx.AsyncClient = None
+) -> List[WebResult]:
+    logger.info(f"Searching {search_engine} via ScraperAPI for keyword: {keyword}")
 
-    # Search engine URLs
+    if not scraperapi_key:
+        logger.error("ScraperAPI key is missing for web search.")
+        return []
+
     search_urls = {
-        "google": "https://www.google.com/search?q={}&hl=en&gl=us", # Add lang/country
-        "bing": "https://www.bing.com/search?q={}&cc=us" # Add country
+        "google": "https://www.google.com/search?q={}&hl=en&gl=us",
+        "bing": "https://www.bing.com/search?q={}&cc=us"
     }
-    base_url = search_urls.get(search_engine, search_urls["google"])
+    base_search_url = search_urls.get(search_engine, search_urls["google"])
 
-    # Encode keyword (consider refining filters based on needs)
-    # Site filter might be too restrictive - removed for broader search
-    # encoded_keyword = quote_plus(keyword + " site:*.edu | site:*.org | site:*.com -inurl:(signup | login | shop)")
-    encoded_keyword = quote_plus(keyword + " -site:youtube.com -site:amazon.com -inurl:(signup|login|cart|shop|product)") # Example refinement
-    url = base_url.format(encoded_keyword)
-    logger.info(f"Requesting URL: {url}")
-
-    results = []
-    # Simplified retry logic: Try full features, then minimal if failed
-    configs_to_try = [
-        {"render_js": True, "asp": True, "country": "US"},  # Full features
-        {"render_js": False, "asp": False, "country": "US"} # Minimal
+    # Add some common negative keywords to the search to filter results directly
+    excluded_sites_and_paths = [
+        "-site:youtube.com", # Exclude specific irrelevant domains
+        "-site:amazon.com",
+        "-inurl:(signup|login|cart|shop|product|download|jobs|careers)", # Exclude common non-informational paths
+        "-filetype:pdf", # Exclude PDF files
+        "-filetype:xml",
+        "-site:wikipedia.org", # Often too general for specific market research
+        "-site:support.google.com",
+        "-site:microsoft.com" # Unless specifically relevant
     ]
-    unique_urls = set() # Track unique URLs
+    encoded_keyword = quote_plus(keyword + " " + " ".join(excluded_sites_and_paths))
+    target_url = base_search_url.format(encoded_keyword)
+    logger.info(f"Target search URL for ScraperAPI: {target_url}")
 
-    for attempt, config in enumerate(configs_to_try, 1):
-        try:
-            scrape_config = ScrapeConfig(
-                url=url,
-                render_js=config["render_js"],
-                country=config["country"],
-                asp=config["asp"],
-                cache=True  # Enable caching
-                # Timeout can sometimes cause issues with complex pages/JS rendering
-            )
-            logger.info(f"Scrapfly attempt {attempt} with config: {config}")
-            result = client.scrape(scrape_config)
-
-            logger.info(f"Scrapfly response status: {result.status_code} (Attempt {attempt})")
-            # logger.debug(f"Raw HTML snippet (Attempt {attempt}): {result.content[:500]}") # Keep debug minimal
-
-            soup = BeautifulSoup(result.content, "html.parser")
-
-            # Selectors need constant maintenance based on search engine HTML structure
-            link_elements = []
-            # Google Selectors (Example - VERIFY THESE)
-            if search_engine == "google":
-                 # Try finding organic results containers first
-                 # This is very fragile - Inspect actual Google HTML
-                 organic_results = soup.select('div.g, div.Ww4FFb, div[jscontroller="SC7lYd"]')
-                 for res_container in organic_results:
-                     link_tag = res_container.select_one('a[href^="http"]')
-                     if link_tag:
-                         title_tag = link_tag.select_one('h3')
-                         if title_tag:
-                              link_elements.append((link_tag, title_tag)) # Store pair
-
-            # Bing Selectors (Example - VERIFY THESE)
-            elif search_engine == "bing":
-                 bing_results = soup.select('li.b_algo')
-                 for res_container in bing_results:
-                     link_tag = res_container.select_one('h2 a[href^="http"]')
-                     if link_tag:
-                          title_tag = link_tag # Bing often has title directly in link
-                          link_elements.append((link_tag, title_tag))
-
-            logger.info(f"Found {len(link_elements)} potential result elements (Attempt {attempt})")
-
-            for link, title_elem in link_elements:
-                href = link.get("href", "")
-                if not href: continue
-
-                # Clean Google redirects (if still necessary)
-                if "/url?q=" in href:
-                    href = href.split("/url?q=")[-1].split("&")[0]
-
-                title = title_elem.get_text(strip=True) if title_elem else "No Title Found"
-                # Basic title cleanup
-                title = ' '.join(title.split()) # Remove excess whitespace
-                if len(title) > 200:
-                    title = title[:197] + "..."
-
-                # Filter URLs and ensure uniqueness
-                if (href.startswith(("http://", "https://")) and
-                    href not in unique_urls and
-                    all(x not in href.lower() for x in ["google.com", "bing.com", "/signup", "/login", "/shop", "/cart", "/product"]) and
-                    title and title != "No Title Found"):
-                    try:
-                         web_result = WebResult(title=title, url=href)
-                         results.append(web_result)
-                         unique_urls.add(href)
-                         if len(results) >= 5: # Limit to 5 results
-                             break
-                    except ValidationError as ve:
-                         logger.warning(f"Validation failed for result: title='{title}', url='{href}'. Error: {ve}")
-
-
-                if len(results) >= 5: break # Exit inner loop
-
-            if results:
-                logger.info(f"Found {len(results)} valid results on attempt {attempt}. Stopping search.")
-                break  # Exit outer loop if results found
-
-        except ScrapflyError as e:
-            logger.error(f"Scrapfly API error (attempt {attempt}): {e}")
-            if e.response: # Check if response object exists
-                 logger.error(f"Status code: {e.response.status_code}, Response body snippet: {e.response.text[:200]}")
-        except Exception as e:
-            logger.error(f"Unexpected error during scraping (attempt {attempt}): {e}", exc_info=True)
-
-        if attempt < len(configs_to_try) and not results:
-            logger.info(f"No results found yet, retrying with config: {configs_to_try[attempt]}")
-        elif not results:
-            logger.warning("All scraping attempts failed or yielded no valid results.")
-
-
-    # Handle case where no results were found after all attempts
-    if not results:
-        logger.warning("No relevant results found after all attempts.")
-
-    logger.info(f"Returning {len(results)} results.")
-    return results[:5] # Ensure maximum 5 results
-
-
-# Main execution function (modified to return results)
-async def run_search(query: str, scrapfly_api_key: str) -> List[WebResult]:
-    """
-    Runs the web search for the given query and returns a list of WebResult objects.
-    """
-    # Simple query cleaning (can be expanded)
-    cleaned_query = query.lower().replace("app for", "").strip()
-    # Construct a keyword phrase suitable for search
-    keyword = f"{cleaned_query} market research OR analysis OR overview OR trends" # Example keyword construction
-    logger.info(f"Using effective keyword: '{keyword}' derived from query: '{query}'")
+    scraper_api_endpoint = "http://api.scraperapi.com"
+    params = {
+        'api_key': scraperapi_key,
+        'url': target_url,
+        'render': 'true',
+        'country_code': 'us',
+        # 'premium': 'true', # Consider for harder targets
+    }
 
     results = []
-    # Try engines sequentially, stopping if results are found
-    for engine in ["google", "bing"]:
-        try:
-             # Run synchronous function in thread pool for asyncio compatibility
-             engine_results = await asyncio.to_thread(search_web_with_scrapfly, keyword, scrapfly_api_key, engine)
-             if engine_results:
-                 results = engine_results
-                 logger.info(f"Successfully retrieved {len(results)} results from {engine}.")
-                 break # Stop searching if results found
-             else:
-                  logger.info(f"No results retrieved from {engine}, trying next engine if available.")
-        except Exception as e:
-            logger.error(f"Error occurred while searching with {engine}: {e}", exc_info=True)
-            # Optionally continue to the next engine or break
+    unique_urls = set()
+    client_to_use = http_client if http_client else httpx.AsyncClient()
 
+    try:
+        logger.info(f"Making request to ScraperAPI for {search_engine} search.")
+        response = await client_to_use.get(scraper_api_endpoint, params=params, timeout=60.0)
+        response.raise_for_status()
+
+        logger.info(f"ScraperAPI response status: {response.status_code} for {search_engine} search.")
+        html_content = response.text
+        soup = BeautifulSoup(html_content, "html.parser")
+        link_elements_data = []
+
+        # --- HTML Selectors (Need Frequent Verification) ---
+        if search_engine == "google":
+            result_blocks = soup.select('div.g, div.Ww4FFb, div.Gx5Zad, div.VCmPNe, div.sATSHe, div.Zn_bQc, div.xpd') # Common Google result blocks
+            for block in result_blocks:
+                link_tag = block.select_one('a[href][data-ved]') or block.select_one('a[href][jsname]') or block.select_one('a[href]')
+                if link_tag and link_tag.get('href','').startswith('http'):
+                    href = link_tag['href']
+                    title_tag = block.select_one('h3')
+                    title_text = title_tag.get_text(strip=True) if title_tag else "Title Not Found"
+                    if title_text and title_text != "Title Not Found" and len(title_text) > 5:
+                        link_elements_data.append({'link': href, 'title': title_text})
+        elif search_engine == "bing":
+            result_blocks = soup.select('li.b_algo')
+            for block in result_blocks:
+                link_tag = block.select_one('h2 a[href]')
+                if link_tag and link_tag.get('href','').startswith('http'):
+                    link_elements_data.append({'link': link_tag['href'], 'title': link_tag.get_text(strip=True)})
+        # --- End HTML Selectors ---
+
+        logger.info(f"Found {len(link_elements_data)} potential result elements via ScraperAPI for {search_engine}.")
+
+        for elem_data in link_elements_data:
+            href = elem_data['link']
+            title = elem_data['title']
+            title = ' '.join(title.split())
+            if len(title) > 150: title = title[:147] + "..." # Slightly shorter title limit
+
+            cleaned_href = unquote(href)
+
+            # Stricter filtering for relevance
+            if (cleaned_href.startswith(("http://", "https://")) and
+                cleaned_href not in unique_urls and
+                not any(skip_domain in cleaned_href.lower() for skip_domain in [
+                    "google.com/search", "bing.com/search", "microsoft.com/search",
+                    "google.com/aclk", "googleadservices.com", "doubleclick.net",
+                    "facebook.com/sharer", "twitter.com/intent", "linkedin.com/share",
+                    "pinterest.com/pin", "youtube.com", "youtube.com/watch?", "amazon.com"
+                ]) and
+                not any(cleaned_href.lower().endswith(ext) for ext in ['.pdf', '.xml', '.ppt', '.doc', '.xls'])
+            ):
+                try:
+                    web_result = WebResult(title=title, url=cleaned_href)
+                    results.append(web_result)
+                    unique_urls.add(cleaned_href)
+                    if len(results) >= 5: # Limit to 5 high-quality results
+                        break
+                except ValidationError as ve:
+                    logger.warning(f"Pydantic validation failed for web result: title='{title}', url='{cleaned_href}'. Error: {ve}")
+
+        logger.info(f"Found {len(results)} valid and unique results after filtering for {search_engine}.")
+
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP error from ScraperAPI during {search_engine} search: {e.response.status_code} for {target_url}")
+        if e.response: logger.debug(f"ScraperAPI Error Response: {e.response.text[:500]}...")
+    except httpx.RequestError as e:
+        logger.error(f"Network error connecting to ScraperAPI for {search_engine} search: {e} for {target_url}")
+    except Exception as e:
+        logger.error(f"Unexpected error during ScraperAPI {search_engine} search for '{keyword}': {e}", exc_info=True)
+    finally:
+        if not http_client and client_to_use:
+            await client_to_use.aclose()
+    return results[:5]
+
+async def run_search(query: str, scraper_api_key: str) -> List[WebResult]:
+    cleaned_query = query.lower().replace("app for", "").strip()
+    keyword = f"{cleaned_query} market research OR analysis OR overview OR trends"
+    logger.info(f"Using effective keyword: '{keyword}' derived from query: '{query}' for blog URL search.")
+
+    results = []
+    async with httpx.AsyncClient() as client:
+        for engine in ["google", "bing"]: # Try Google first, then Bing as fallback
+            try:
+                engine_results = await search_web_with_scraperapi(keyword, scraper_api_key, engine, http_client=client)
+                if engine_results:
+                    results = engine_results
+                    logger.info(f"Successfully retrieved {len(results)} results from {engine} via ScraperAPI.")
+                    break
+                logger.info(f"No results from {engine} via ScraperAPI, trying next if available.")
+            except Exception as e:
+                logger.error(f"Error searching {engine} via ScraperAPI: {e}", exc_info=True)
     return results
 
-
 if __name__ == "__main__":
-    # Example query
-    query = "dating app" # Simplified query
+    example_query = "ai in healthcare"
+    logger.info(f"--- Starting Blog URL Search (ScraperAPI) for query: '{example_query}' ---")
+    
+    api_key = os.getenv("SCRAPERAPI_KEY")
+    if not api_key:
+        logger.error("SCRAPERAPI_KEY not found in environment for standalone test.")
+        sys.exit(1)
+        
+    final_results = asyncio.run(run_search(example_query, api_key))
+    logger.info(f"--- Blog URL Search finished for query: '{example_query}' ---")
 
-    logger.info(f"--- Starting search for query: '{query}' ---")
-    # Run the async search function
-    final_results = asyncio.run(run_search(query, scrapfly_api_key))
-    logger.info(f"--- Search finished for query: '{query}' ---")
-
-    # --- OUTPUT MODIFICATION ---
-    # Convert the list of Pydantic WebResult models to a list of Python dictionaries
     results_dict_list = [result.model_dump() for result in final_results]
-
-    # Convert the list of dictionaries to a JSON formatted string
-    # Use indent=2 for pretty-printing as shown in the desired format
     json_output = json.dumps(results_dict_list, indent=2)
-
-    # Print the final JSON string to standard output
     print(json_output)

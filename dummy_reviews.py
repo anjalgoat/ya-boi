@@ -66,16 +66,25 @@ class AppReviewData(BaseModel):
 
 # --- Review Extractor Agent Definition ---
 
-# System prompt for the review generation agent
+# Updated system prompt for the review generation agent
 review_agent_system_prompt = (
-    "You are an AI assistant specialized in generating realistic fake app reviews based on an app's name and target platforms. "
-    "Given an app name (e.g., 'DraftKings') and the platforms it's available on (e.g., 'App Store and Google Play'), "
-    "generate exactly 3 distinct, plausible-sounding fake reviews for EACH specified platform. "
+    "You are an AI assistant specialized in generating realistic fake app reviews for market research purposes. "
+    "Given an app name (e.g., 'Spotify') and the platforms it's available on (e.g., 'App Store and Google Play'), "
+    "generate **exactly 10 distinct, human-like fake reviews for EACH specified platform**.\n"
+    "These reviews should be varied:\n"
+    "- Some should be highly positive (5 stars), praising specific features or overall experience.\n"
+    "- Some should be moderately positive (4 stars), perhaps with minor suggestions.\n"
+    "- Some should be neutral or mixed (3 stars), pointing out both pros and cons.\n"
+    "- Some should be moderately negative (2 stars), highlighting issues or frustrations.\n"
+    "- Some should be very negative (1 star), detailing significant problems or dealbreakers.\n"
+    "Mention plausible features, bugs, performance aspects, UI/UX comments, customer service experiences, etc.\n"
     "Each review must include:\n"
-    "1. A 'rating' (integer between 1 and 5).\n"
-    "2. 'text' (1-3 sentences long, varied in tone - positive, negative, mentioning features, bugs, etc.).\n"
-    "Structure your entire response strictly as an AppReviewData JSON object, containing 'competitor_name', 'app_store_reviews' (list), and 'google_play_reviews' (list)."
+    "1. A 'rating' (integer between 1 and 5, reflecting the review's sentiment).\n"
+    "2. 'text' (1-4 sentences long, reflecting the rating and varied in tone).\n"
+    "Structure your entire response strictly as an AppReviewData JSON object, containing 'competitor_name', "
+    "'app_store_reviews' (list of 10 reviews), and 'google_play_reviews' (list of 10 reviews if both platforms requested)."
     " Ensure the competitor_name matches the input app name."
+    " If only one platform is requested (e.g., only App Store URL provided), generate 10 reviews only for that platform and leave the other platform's review list empty."
 )
 
 # Create the review extractor agent
@@ -112,8 +121,11 @@ async def generate_fake_reviews_for_app(competitor: Competitor) -> Optional[AppR
     # Construct the prompt for the review agent
     platform_string = " and ".join(platforms)
     prompt = (
-        f"Generate exactly 3 fake reviews for the app named '{competitor.name}'. "
-        f"Provide reviews for the following platform(s): {platform_string}. "
+        f"Generate exactly 10 fake reviews for the app named '{competitor.name}'. "  # Changed from 3 to 10
+        f"If an App Store URL was provided, provide 10 App Store reviews. "
+        f"If a Google Play URL was provided, provide 10 Google Play reviews. "
+        f"The app is available on: {platform_string}. "
+        f"Follow all instructions regarding review variety, rating, and text. "
         f"Output the result strictly as an AppReviewData JSON object."
     )
     logger.debug(f"Review generation prompt for '{competitor.name}':\n{prompt}")
@@ -143,12 +155,12 @@ async def generate_fake_reviews_for_app(competitor: Competitor) -> Optional[AppR
             logger.debug(f"Removing Google Play reviews for {competitor.name} as URL was not provided.")
             result_data.google_play_reviews = []
 
-        # Validate that we got the expected number of reviews per requested platform
-        if "App Store" in platforms and len(result_data.app_store_reviews) != 3:
-             logger.warning(f"Expected 3 App Store reviews for {competitor.name}, but got {len(result_data.app_store_reviews)}.")
-        if "Google Play" in platforms and len(result_data.google_play_reviews) != 3:
-             logger.warning(f"Expected 3 Google Play reviews for {competitor.name}, but got {len(result_data.google_play_reviews)}.")
-
+        # Update validation checks for 10 reviews
+        expected_reviews_count = 10
+        if "App Store" in platforms and len(result_data.app_store_reviews) != expected_reviews_count:
+            logger.warning(f"Expected {expected_reviews_count} App Store reviews for {competitor.name}, but got {len(result_data.app_store_reviews)}.")
+        if "Google Play" in platforms and len(result_data.google_play_reviews) != expected_reviews_count:
+            logger.warning(f"Expected {expected_reviews_count} Google Play reviews for {competitor.name}, but got {len(result_data.google_play_reviews)}.")
 
         logger.info(f"Successfully generated review data for '{competitor.name}'")
         return result_data

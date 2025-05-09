@@ -1,16 +1,17 @@
+import sys
 import asyncio
 import logging
-import json # Added for JSON parsing/dumping
+import json 
 from typing import List
-from pydantic import BaseModel, Field, ValidationError # Added ValidationError
+from pydantic import BaseModel, Field, ValidationError 
 from pydantic_ai import Agent, RunContext, ModelRetry
-from pydantic_ai.models.openai import OpenAIModel # Still needed for Agent
+from pydantic_ai.models.openai import OpenAIModel # 
 from scrapfly import ScrapflyClient, ScrapeConfig, ScrapflyScrapeError
 from readability import Document
 from bs4 import BeautifulSoup
 import os
 from dotenv import load_dotenv
-from openai import AsyncOpenAI # Import the standard OpenAI async client
+from openai import AsyncOpenAI 
 
 # Logging setup
 logging.basicConfig(
@@ -309,93 +310,109 @@ async def validate_result(ctx: RunContext[None], result: InitialScrapeResponse) 
     return ScrapeResponse(results=final_results)
 
 
-# --- Removed the old print_results function ---
-
-# Example Input JSON (as a string)
-input_json_string = """
-[
-  {
-    "title": "Build a Sports Betting App Like FanDuel: A Detailed Guide!",
-    "url": "https://www.apptunix.com/blog/how-to-develop-a-sports-betting-app-like-fanduel-a-detailed-guide/"
-  },
-  {
-    "title": "Sports Betting Market Size & Share Analysis Report, 2030",
-    "url": "https://www.grandviewresearch.com/industry-analysis/sports-betting-market-report"
-  },
-  {
-      "title": "Invalid URL Example",
-      "url": "htp://example.com/invalid"
-  },
-    {
-      "title": "Eilers & Krejcik Gaming Consulting and Market Research",
-      "url": "https://ekgamingllc.com/"
-  }
-]
-"""
-
 # Main execution
 async def main():
-    """Main function to parse input JSON, run the agent, process results, and print final JSON."""
-    logger.info("Starting agent execution")
+    """Main function to parse input JSON from stdin, run the agent, process results, and print final JSON."""
+    logger.info("Starting craw4ai.py agent execution. Reading URLs from stdin...")
 
-    # 1. Parse Input JSON
+    parsed_urls: List[UrlInput] = []
+    input_json_from_stdin_str: str = ""
+    error_response_sent = False
+
+    # 1. Parse Input JSON from Stdin
     try:
-        input_data = json.loads(input_json_string)
-        # Validate basic structure (list of dicts)
+        input_json_from_stdin_str = sys.stdin.read()
+        
+        if not input_json_from_stdin_str.strip():
+            logger.error("craw4ai.py: No input received from stdin.")
+            error_output = ScrapeResponse(results=[
+                ScrapeResult(url="N/A", title="Input Error", summary="No input URLs received via stdin.", insight="N/A", relevance="N/A")
+            ])
+            print(error_output.model_dump_json(indent=2))
+            error_response_sent = True
+            return
+
+        input_data = json.loads(input_json_from_stdin_str)
+        
         if not isinstance(input_data, list) or not all(isinstance(item, dict) for item in input_data):
-            raise ValueError("Input must be a JSON list of objects.")
-        # Convert to UrlInput objects, handling potential validation errors
-        parsed_urls = [UrlInput(**item) for item in input_data]
-        logger.info(f"Successfully parsed {len(parsed_urls)} URLs from input JSON.")
+            logger.error("craw4ai.py: Input from stdin must be a JSON list of objects.")
+            raise ValueError("Input from stdin must be a JSON list of objects.")
+        
+        temp_parsed_urls = []
+        for item in input_data:
+            try:
+                temp_parsed_urls.append(UrlInput(**item))
+            except ValidationError as e_item:
+                logger.warning(f"craw4ai.py: Skipping an item due to validation error: {item}. Error: {e_item.errors()}")
+        parsed_urls = temp_parsed_urls
+        
+        if not parsed_urls:
+            logger.error("craw4ai.py: No valid URL items to process after parsing stdin.")
+            error_output = ScrapeResponse(results=[
+                 ScrapeResult(url="N/A", title="Input Error", summary="No valid URL items found in stdin input.", insight="N/A", relevance="N/A")
+            ])
+            print(error_output.model_dump_json(indent=2))
+            error_response_sent = True
+            return
+
+        logger.info(f"craw4ai.py: Successfully parsed {len(parsed_urls)} URLs from stdin.")
+
     except json.JSONDecodeError:
-        logger.error("Invalid JSON input provided.")
-        print(json.dumps({"error": "Invalid JSON input format."}, indent=2))
+        logger.error(f"craw4ai.py: Invalid JSON input provided via stdin. Content: {input_json_from_stdin_str[:500]}...")
+        error_output = ScrapeResponse(results=[
+            ScrapeResult(url="N/A", title="JSON Error", summary="Invalid JSON input format from stdin.", insight="N/A", relevance="N/A")
+        ])
+        print(error_output.model_dump_json(indent=2))
+        error_response_sent = True
         return
     except ValidationError as e:
-        logger.error(f"Input data validation error: {e}")
-        print(json.dumps({"error": f"Input data validation failed: {e}"}, indent=2))
+        logger.error(f"craw4ai.py: Input data validation error for items from stdin: {e}")
+        error_output = ScrapeResponse(results=[
+            ScrapeResult(url="N/A", title="Validation Error", summary=f"Input data validation failed: {e}", insight="N/A", relevance="N/A")
+        ])
+        print(error_output.model_dump_json(indent=2))
+        error_response_sent = True
         return
     except Exception as e:
-        logger.error(f"Error parsing input JSON: {e}", exc_info=True)
-        print(json.dumps({"error": f"Error processing input: {e}"}, indent=2))
+        logger.error(f"craw4ai.py: Error parsing input JSON from stdin: {e}", exc_info=True)
+        error_output = ScrapeResponse(results=[
+            ScrapeResult(url="N/A", title="Parsing Error", summary=f"Error processing input from stdin: {e}", insight="N/A", relevance="N/A")
+        ])
+        print(error_output.model_dump_json(indent=2))
+        error_response_sent = True
         return
 
-    # Handle case where input JSON was empty or all items failed parsing/validation
-    if not parsed_urls:
-         logger.warning("No valid URLs to process after parsing input.")
-         print(json.dumps({"results": []})) # Output empty results list as per format
+    if not parsed_urls and not error_response_sent:
+         logger.warning("craw4ai.py: No valid URLs to process after parsing input from stdin.")
+         print(ScrapeResponse(results=[]).model_dump_json(indent=2))
          return
 
     # 2. Format input for the agent
-    # The agent expects a string prompt. We'll format the parsed URLs into that string.
-    input_str = f"Process these URLs for betting market research:\n" + \
-                "\n".join([f"- {u.title}: {u.url}" for u in parsed_urls])
+    agent_prompt_str = "For betting app market research, please process the following URLs and their titles:\n"
+    for u in parsed_urls:
+        agent_prompt_str += f"- Title: '{u.title}', URL: '{u.url}'\n"
+    agent_prompt_str += "\nReturn these as an InitialScrapeResponse."
 
     # 3. Run the agent and processing pipeline
     final_response_data = None
     try:
-        # Run the initial agent call (which triggers the validator and scraping)
-        response_container = await scraper_agent.run(input_str)
+        response_container = await scraper_agent.run(agent_prompt_str)
 
-        # Check the final response from the validator
         if response_container and isinstance(response_container.data, ScrapeResponse):
             final_response_data = response_container.data
-            logger.info(f"Agent execution and processing successful. Got {len(final_response_data.results)} results.")
+            logger.info(f"craw4ai.py: Agent execution and processing successful. Got {len(final_response_data.results)} results.")
         else:
-            # Log details if the agent run failed or returned unexpected data
             error_details = getattr(response_container, 'error', 'Unknown error')
             data_type = type(getattr(response_container, 'data', None))
-            logger.error(f"Agent execution failed or returned unexpected data type: {data_type}. Error: {error_details}")
-            # Create a fallback error response in the desired structure
+            logger.error(f"craw4ai.py: Agent execution failed or returned unexpected data type: {data_type}. Error: {error_details}")
             final_response_data = ScrapeResponse(results=[ScrapeResult(
-                url="N/A", title="Processing Error",
+                url="N/A", title="Agent Error",
                 summary=f"Agent execution failed. Type: {data_type}, Error: {error_details}",
-                insight="No insight available.", relevance="N/A - processing error."
+                insight="No insight available.", relevance="N/A - agent processing error."
             )])
 
     except Exception as e:
-        logger.error(f"An error occurred during main agent execution: {e}", exc_info=True)
-        # Create a fallback error response
+        logger.error(f"craw4ai.py: An error occurred during main agent execution: {e}", exc_info=True)
         final_response_data = ScrapeResponse(results=[ScrapeResult(
              url="N/A", title="Critical Execution Error",
              summary=f"A critical error occurred during execution: {e}",
@@ -403,14 +420,15 @@ async def main():
         )])
 
     # 4. Output the final result as JSON
-    # Use Pydantic's .model_dump_json() for proper serialization respecting field aliases etc.
     if final_response_data:
-         output_json = final_response_data.model_dump_json(indent=2)
+         output_json = final_response_data.model_dump_json(indent=2, exclude_none=True)
          print(output_json)
     else:
-         # Should not happen if error handling above is correct, but as a safeguard
-         logger.error("Final response data was unexpectedly None.")
-         print(json.dumps({"results": [], "error": "Failed to generate final response."}, indent=2))
+         logger.error("craw4ai.py: Final response data was unexpectedly None after all processing.")
+         fallback_error = ScrapeResponse(results=[
+             ScrapeResult(url="N/A", title="Internal Error", summary="Failed to generate final response.", insight="N/A", relevance="N/A")
+         ])
+         print(fallback_error.model_dump_json(indent=2, exclude_none=True))
 
 
 if __name__ == "__main__":
