@@ -142,7 +142,8 @@ def _first_value(left: Any, right: Any) -> Any:
 # --- State Definition ---
 class LangGraphState(TypedDict):
     user_query: str
-    scrapfly_api_key: Annotated[Optional[str], _first_value]
+    # scrapfly_api_key: Annotated[Optional[str], _first_value] # No longer primary for blog_url
+    scraperapi_key: Annotated[Optional[str], _first_value] # ADDED for ScraperAPI
     competitor_data: Annotated[Optional[CompetitorAgentResponse], _first_value]
     blog_urls: Annotated[Optional[List[WebResult]], _first_value]
     trends_data: Annotated[Optional[GoogleTrendsResult], _first_value] # Re-added for trend_analyzer output
@@ -190,13 +191,16 @@ async def competitor_node(state: LangGraphState) -> Dict[str, Any]:
 async def blog_url_node(state: LangGraphState) -> Dict[str, Any]:
     logger.info(f"Blog URL Node: Running for query '{state.get('user_query', 'NOT_FOUND')}'")
     errors_list = list(state.get('error', []))
-    scrapfly_api_key = state.get('scrapfly_api_key')
-    if not scrapfly_api_key:
-        logger.error("Missing Scrapfly API key for Blog URL Agent.")
-        errors_list = append_to_errors(errors_list, "Missing Scrapfly API key for Blog URL search")
+    # MODIFIED: Use scraperapi_key from state
+    key_for_blog_url = state.get('scraperapi_key') 
+    if not key_for_blog_url:
+        # MODIFIED: Updated error message
+        logger.error("Missing ScraperAPI key for Blog URL Agent.")
+        errors_list = append_to_errors(errors_list, "Missing ScraperAPI key for Blog URL search")
         return {"blog_urls": [], "error": errors_list}
     try:
-        result: List[WebResult] = await blog_url_run_search(state['user_query'], scrapfly_api_key)
+        # MODIFIED: Pass the correct key
+        result: List[WebResult] = await blog_url_run_search(state['user_query'], key_for_blog_url)
         logger.info(f"Blog URL Agent finished. Found {len(result)} URLs.")
         return {"blog_urls": result, "error": errors_list or None}
     except Exception as e:
@@ -210,6 +214,11 @@ async def trend_analyzer_node(state: LangGraphState) -> Dict[str, Any]: # Re-add
     errors_list = list(state.get('error', []))
     keyword = state['user_query']
     country_code = "US"
+    # Note: trend_analyzer.py directly uses os.getenv("SCRAPERAPI_KEY").
+    # If you want this node to also use a key from the state for consistency,
+    # you'd need to modify trend_analyzer.py to accept the key as a parameter.
+    # For now, it will continue to use its environment variable.
+    # You could also pass state.get('scraperapi_key') to it if trend_analyzer.py is modified.
     try:
         result: Optional[GoogleTrendsResult] = await run_trends_agent(keyword=keyword, country=country_code)
         if result:
@@ -231,6 +240,12 @@ async def craw4ai_node(state: LangGraphState) -> Dict[str, Any]:
     logger.info("Craw4ai Node: Processing blog URLs...")
     errors_list = list(state.get('error', []))
     blog_urls_data = state.get('blog_urls')
+
+    # craw4ai.py uses os.getenv("SCRAPFLY_API_KEY") internally.
+    # If you want craw4ai to use ScraperAPI, you would need to:
+    # 1. Modify craw4ai.py to accept an API key and use ScraperAPI.
+    # 2. Pass state.get('scraperapi_key') to it.
+    # For now, it will attempt to use Scrapfly key from its env vars.
 
     if not blog_urls_data:
         logger.warning("Craw4ai Node: No blog URLs found in state to process.")
@@ -321,13 +336,9 @@ def _transform_craw4ai_to_summarizer_web(craw4ai_data: Optional[List[Craw4aiScra
     summarizer_web_results = []
     for item in craw4ai_data:
         try:
-            # Ensure URL is valid for HttpUrl, handle "N/A" or other invalid strings
-            # craw4ai.py should ideally not output "N/A" for a URL if it's an error case,
-            # but rather omit the result or use a valid placeholder.
-            # For now, we'll try to parse and skip if invalid.
             if item.url and item.url.lower() != "n/a" and "example.com/not_available" not in item.url :
                  summarizer_web_results.append(SummarizerWebpageResult(
-                    url=HttpUrl(item.url), # Attempt conversion to HttpUrl
+                    url=HttpUrl(item.url), 
                     title=item.title,
                     summary=item.summary,
                     insight=item.insight,
@@ -335,7 +346,7 @@ def _transform_craw4ai_to_summarizer_web(craw4ai_data: Optional[List[Craw4aiScra
                 ))
             else:
                 logger.warning(f"Skipping invalid URL for summarizer input: {item.url}")
-        except Exception as e_url: # Catch Pydantic's HttpUrl validation error or others
+        except Exception as e_url: 
             logger.warning(f"Could not convert URL '{item.url}' to HttpUrl for summarizer: {e_url}")
             
     return SummarizerWebpageInsightsInput(results=summarizer_web_results) if summarizer_web_results else None
@@ -359,7 +370,6 @@ async def summarizer_node(state: LangGraphState) -> Dict[str, Any]:
     errors_list = list(state.get('error', []))
     user_query = state.get('user_query', "N/A")
     
-    # Prepare inputs for summarizer.py's FullMarketInput
     trends_input = _transform_google_trends_to_summarizer_trends(state.get('trends_data'))
     web_insights_input = _transform_craw4ai_to_summarizer_web(state.get('scraped_web_content'))
     reviews_input = _transform_dummy_reviews_to_summarizer_reviews(state.get('generated_reviews'))
@@ -404,10 +414,9 @@ async def diagram_agent_node(state: LangGraphState) -> Dict[str, Any]:
     logger.info("Diagram Agent Node: Preparing data and running diagram_agent.py...")
     errors_list = list(state.get('error', []))
 
-    # Prepare inputs for diagram_agent.py's RawMarketDataInput
-    trends_input = _transform_google_trends_to_summarizer_trends(state.get('trends_data')) # Re-use transformation
-    web_insights_input = _transform_craw4ai_to_summarizer_web(state.get('scraped_web_content')) # Re-use transformation
-    reviews_input = _transform_dummy_reviews_to_summarizer_reviews(state.get('generated_reviews')) # Re-use transformation
+    trends_input = _transform_google_trends_to_summarizer_trends(state.get('trends_data')) 
+    web_insights_input = _transform_craw4ai_to_summarizer_web(state.get('scraped_web_content')) 
+    reviews_input = _transform_dummy_reviews_to_summarizer_reviews(state.get('generated_reviews')) 
 
     if not trends_input and not web_insights_input and not reviews_input:
         logger.warning("Diagram Agent Node: No data from previous steps to create diagrams from.")
@@ -448,23 +457,22 @@ async def diagram_agent_node(state: LangGraphState) -> Dict[str, Any]:
 workflow = StateGraph(LangGraphState)
 workflow.add_node("competitor", competitor_node)
 workflow.add_node("blog_url", blog_url_node)
-workflow.add_node("trend_analyzer", trend_analyzer_node) # Re-added
+workflow.add_node("trend_analyzer", trend_analyzer_node) 
 workflow.add_node("craw4ai_scraper", craw4ai_node)
 workflow.add_node("dummy_review_generator", dummy_reviews_node)
 workflow.add_node("summarizer", summarizer_node)
 workflow.add_node("diagram_generator", diagram_agent_node)
 
 # Entry points
-workflow.add_edge("__start__", "competitor")
-workflow.add_edge("__start__", "blog_url")
-workflow.add_edge("__start__", "trend_analyzer")
+# MODIFIED: Fully sequential start for initial agents
+workflow.add_edge("__start__", "competitor")        # 1st: competitor starts
+workflow.add_edge("competitor", "blog_url")       # 2nd: blog_url starts after competitor
+workflow.add_edge("blog_url", "trend_analyzer")   # 3rd: trend_analyzer starts after blog_url
 
 # Sequence
 workflow.add_edge("blog_url", "craw4ai_scraper")
 workflow.add_edge("competitor", "dummy_review_generator")
 
-# Nodes feeding into summarizer and diagram_generator
-# These nodes will wait for all their direct predecessors to complete.
 workflow.add_edge("craw4ai_scraper", "summarizer")
 workflow.add_edge("dummy_review_generator", "summarizer")
 workflow.add_edge("trend_analyzer", "summarizer")
@@ -473,7 +481,6 @@ workflow.add_edge("craw4ai_scraper", "diagram_generator")
 workflow.add_edge("dummy_review_generator", "diagram_generator")
 workflow.add_edge("trend_analyzer", "diagram_generator")
 
-# End points
 workflow.add_edge("summarizer", END)
 workflow.add_edge("diagram_generator", END)
 
@@ -489,14 +496,15 @@ def pydantic_model_dumper(obj):
         raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable and str() failed")
 
 # --- Workflow Runner ---
-async def run_workflow(query: str, scrapfly_key: Optional[str] = None):
+# MODIFIED: run_workflow now accepts scraperapi_key
+async def run_workflow(query: str, scraperapi_key_param: Optional[str] = None):
     logger.critical("IMPORTANT: Ensure OPENROUTER_API_KEY is valid and accessible to avoid 401 errors.")
     initial_state = LangGraphState(
         user_query=query,
-        scrapfly_api_key=scrapfly_key,
-        competitor_data=None, blog_urls=None, trends_data=None, # trends_data re-added
+        scraperapi_key=scraperapi_key_param, # MODIFIED: Use scraperapi_key_param
+        competitor_data=None, blog_urls=None, trends_data=None, 
         scraped_web_content=None, generated_reviews=None,
-        market_summary_report=None, chart_data=None, # New fields
+        market_summary_report=None, chart_data=None, 
         error=[]
     )
     logger.info(f"DEBUG: initial_state created: {initial_state}")
@@ -504,15 +512,9 @@ async def run_workflow(query: str, scrapfly_key: Optional[str] = None):
     
     reconstructed_final_state = initial_state.copy()
     try:
-        async for s_update_dict in app.astream(initial_state, {"recursion_limit": 20}): # Increased recursion limit slightly
+        async for s_update_dict in app.astream(initial_state, {"recursion_limit": 20}): 
             logger.debug(f"Graph stream update (node output dict): {s_update_dict}")
-            # s_update_dict is a dictionary where keys are node names and values are their outputs.
-            # The last event in the stream is the final state of the graph.
-            # The structure of `s_update_dict` for the last event should be the full state.
-            # Let's assume the last `s_update_dict` is the final state if it contains all keys from LangGraphState.
-            # Or, more simply, it's the latest snapshot of the state. LangGraph handles merging.
-            # The very last item from astream IS the final state object.
-            reconstructed_final_state = s_update_dict # The last event is the final state.
+            reconstructed_final_state = s_update_dict 
 
         logger.info("Graph invocation complete.")
         final_errors = reconstructed_final_state.get('error', [])
@@ -525,7 +527,7 @@ async def run_workflow(query: str, scrapfly_key: Optional[str] = None):
 
     except Exception as graph_exec_error:
         logger.error(f"Exception during graph execution: {graph_exec_error}", exc_info=True)
-        final_state_to_print = initial_state.copy() # Fallback to initial on catastrophic failure
+        final_state_to_print = initial_state.copy() 
         current_errors = list(final_state_to_print.get('error', []))
         current_errors = append_to_errors(current_errors, f"Graph execution error: {graph_exec_error}")
         final_state_to_print['error'] = current_errors
@@ -538,17 +540,24 @@ async def run_workflow(query: str, scrapfly_key: Optional[str] = None):
 # --- Main Execution ---
 if __name__ == "__main__":
     user_query = "app for music" 
-    scrapfly_api_key_env = os.getenv("SCRAPFLY_API_KEY")
+    # REMOVED: scrapfly_api_key_env
+    # ADDED: Get ScraperAPI key from environment
+    scraperapi_key_env = os.getenv("SCRAPERAPI_KEY") 
     openrouter_api_key_env = os.getenv("OPENROUTER_API_KEY") 
 
     if not openrouter_api_key_env:
         logger.critical("FATAL: OPENROUTER_API_KEY not found. LLM agents WILL FAIL. Please set it.")
-    if not scrapfly_api_key_env:
-        logger.warning("SCRAPFLY_API_KEY not found. Some agents might fail.")
+    # MODIFIED: Check for ScraperAPI key
+    if not scraperapi_key_env:
+        logger.warning("SCRAPERAPI_KEY not found in environment. Blog URL and Trend Analyzer agents might fail or use fallback.")
+    else:
+        logger.info("SCRAPERAPI_KEY found in environment and will be passed to the workflow.")
+
 
     scripts_to_check = ['craw4ai.py', 'dummy_reviews.py', 'competitor.py', 'blog_url.py', 'trend_analyzer.py', 'summarizer.py', 'diagram_agent.py']
     for script in scripts_to_check:
         if not os.path.exists(os.path.join(os.path.dirname(__file__), script)):
             logger.error(f"{script} not found. Subprocess/import calls may fail.")
 
-    asyncio.run(run_workflow(query=user_query, scrapfly_key=scrapfly_api_key_env))
+    # MODIFIED: Pass the scraperapi_key_env to run_workflow
+    asyncio.run(run_workflow(query=user_query, scraperapi_key_param=scraperapi_key_env))
